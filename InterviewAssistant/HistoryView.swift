@@ -13,23 +13,36 @@ struct HistoryView: View {
     @ObservedObject var coordinator: InterviewCoordinator
     @Binding var selection: UUID?
 
+    @State private var searchQuery: String = ""
+
     var body: some View {
         List(selection: $selection) {
-            Section("Сессии") {
-                ForEach(coordinator.allSessions) { session in
-                    SessionRow(session: session)
-                        .tag(session.id)
-                        .contextMenu {
-                            Button(role: .destructive) {
-                                coordinator.deleteSession(session.id)
-                            } label: {
-                                Label("Удалить", systemImage: "trash")
-                            }
+            if !searchQuery.isEmpty {
+                Section("Найдено: \(filteredSessions.count)") {
+                    if filteredSessions.isEmpty {
+                        Text("Ничего не найдено")
+                            .foregroundStyle(.secondary)
+                            .font(.caption)
+                            .padding(.vertical, 8)
+                    } else {
+                        ForEach(filteredSessions) { session in
+                            sessionRowView(session)
                         }
+                    }
+                }
+            } else {
+                ForEach(groupedSessions, id: \.label) { group in
+                    Section(group.label) {
+                        ForEach(group.sessions) { session in
+                            sessionRowView(session)
+                        }
+                    }
                 }
             }
         }
         .listStyle(.sidebar)
+        .searchable(text: $searchQuery, placement: .sidebar,
+                    prompt: "Поиск по сессиям…")
         .toolbar {
             ToolbarItem {
                 Button {
@@ -38,12 +51,105 @@ struct HistoryView: View {
                 } label: {
                     Label("Новая запись", systemImage: "plus")
                 }
-                .help("Новая запись")
+                .help("Новая запись (⌘N)")
+            }
+            ToolbarItem {
+                SettingsLink {
+                    Label("Настройки", systemImage: "gearshape")
+                }
+                .help("Настройки (⌘,)")
             }
         }
         .onAppear {
-            coordinator.refreshSessions()
+            // On first appearance, also pick up any half-finished
+            // transcriptions from previous app runs.
+            coordinator.resumeIncompleteTranscriptions()
         }
+    }
+
+    // MARK: - Row + groups
+
+    @ViewBuilder
+    private func sessionRowView(_ session: Session) -> some View {
+        SessionRow(
+            session: session,
+            isTranscribing: coordinator.transcribingSessionID == session.id,
+            isQueued: coordinator.queuedTranscriptionIDs.contains(session.id)
+        )
+            .tag(session.id)
+            .contextMenu {
+                Button {
+                    coordinator.revealInFinder(session.id)
+                } label: {
+                    Label("Открыть в Finder", systemImage: "folder")
+                }
+                Divider()
+                Button(role: .destructive) {
+                    coordinator.deleteSession(session.id)
+                } label: {
+                    Label("Удалить", systemImage: "trash")
+                }
+            }
+    }
+
+    /// Group sessions into "Сегодня", "Вчера", "На этой неделе", "Раньше".
+    private var groupedSessions: [(label: String, sessions: [Session])] {
+        let calendar = Calendar.current
+        let now = Date()
+
+        var today:    [Session] = []
+        var yesterday:[Session] = []
+        var thisWeek: [Session] = []
+        var earlier:  [Session] = []
+
+        for s in coordinator.allSessions {
+            let date = s.metadata.recordedAt
+            if calendar.isDateInToday(date) {
+                today.append(s)
+            } else if calendar.isDateInYesterday(date) {
+                yesterday.append(s)
+            } else if let days = calendar.dateComponents([.day], from: date, to: now).day,
+                      days <= 7 {
+                thisWeek.append(s)
+            } else {
+                earlier.append(s)
+            }
+        }
+
+        var result: [(label: String, sessions: [Session])] = []
+        if !today.isEmpty     { result.append(("Сегодня",        today)) }
+        if !yesterday.isEmpty { result.append(("Вчера",          yesterday)) }
+        if !thisWeek.isEmpty  { result.append(("На этой неделе", thisWeek)) }
+        if !earlier.isEmpty   { result.append(("Раньше",         earlier)) }
+        return result
+    }
+
+    // MARK: - Filtering
+
+    private var filteredSessions: [Session] {
+        let q = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !q.isEmpty else { return coordinator.allSessions }
+
+        return coordinator.allSessions.filter { session in
+            matches(session, query: q)
+        }
+    }
+
+    private func matches(_ session: Session, query q: String) -> Bool {
+        if session.metadata.candidateName?.lowercased().contains(q) == true { return true }
+        if session.metadata.position?.lowercased().contains(q)      == true { return true }
+
+        if let segments = session.transcript?.segments {
+            for seg in segments {
+                if seg.text.lowercased().contains(q) { return true }
+            }
+        }
+        if let imp = session.summary?.overallImpression.lowercased(),
+           imp.contains(q) { return true }
+        if let rec = session.recommendation?.rationale.lowercased(),
+           rec.contains(q) { return true }
+
+        return false
     }
 }
 
@@ -51,6 +157,8 @@ struct HistoryView: View {
 
 private struct SessionRow: View {
     let session: Session
+    var isTranscribing: Bool = false
+    var isQueued: Bool = false
 
     private static let dateFormatter: DateFormatter = {
         let f = DateFormatter()
@@ -72,7 +180,21 @@ private struct SessionRow: View {
             Text(Self.dateFormatter.string(from: session.metadata.recordedAt))
                 .font(.caption)
                 .foregroundStyle(.secondary)
-            badges
+
+            if isTranscribing {
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.mini)
+                    Text("Транскрибируется…")
+                        .font(.caption2)
+                        .foregroundStyle(.blue)
+                }
+            } else if isQueued {
+                Text("В очереди")
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
+            } else {
+                badges
+            }
         }
         .padding(.vertical, 4)
     }

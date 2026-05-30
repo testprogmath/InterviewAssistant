@@ -26,11 +26,16 @@ enum TranscriptExport {
         if let transcript = session.transcript {
             lines.append("## Транскрипт")
             lines.append("")
+            let showSpeaker = transcript.isMultiSpeaker
             for seg in transcript.segments {
                 let mins = Int(seg.startTime) / 60
                 let secs = Int(seg.startTime) % 60
                 let ts   = String(format: "%02d:%02d", mins, secs)
-                lines.append("**[\(ts) · \(seg.speaker.localizedName)]** \(seg.text)")
+                if showSpeaker {
+                    lines.append("**[\(ts) · \(seg.speaker.localizedName)]** \(seg.text)")
+                } else {
+                    lines.append("**[\(ts)]** \(seg.text)")
+                }
                 lines.append("")
             }
         }
@@ -52,11 +57,17 @@ enum TranscriptExport {
                 lines.append("")
             }
             if !s.highlights.isEmpty {
+                let showSpeaker = session.transcript?.isMultiSpeaker ?? true
                 lines.append("### Интересные моменты")
                 for h in s.highlights {
                     let mins = Int(h.timestamp) / 60
                     let secs = Int(h.timestamp) % 60
-                    lines.append("- **\(String(format: "%02d:%02d", mins, secs)) · \(h.speaker.localizedName):** «\(h.quote)» — \(h.why)")
+                    let ts = String(format: "%02d:%02d", mins, secs)
+                    if showSpeaker {
+                        lines.append("- **\(ts) · \(h.speaker.localizedName):** «\(h.quote)» — \(h.why)")
+                    } else {
+                        lines.append("- **\(ts):** «\(h.quote)» — \(h.why)")
+                    }
                 }
                 lines.append("")
             }

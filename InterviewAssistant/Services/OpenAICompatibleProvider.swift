@@ -51,12 +51,65 @@ final class OpenAICompatibleProvider: AnalysisProvider, @unchecked Sendable {
         self.session = URLSession(configuration: config)
     }
 
+    // MARK: - Map-reduce for long transcripts
+
+    /// Character budget above which we condense the transcript before
+    /// feeding it to a structured-output prompt. ~80k chars ≈ 20k tokens,
+    /// safe for most models' context windows.
+    private let condenseThreshold = 80_000
+
+    /// If the transcript would blow the model's context, run a map-reduce
+    /// pass: summarise each chunk separately, then synthesise a single
+    /// shorter "condensed transcript" with all the key facts.
+    private func ensureFits(_ transcript: Transcript) async throws -> Transcript {
+        let size = TranscriptChunker.estimatedChars(transcript)
+        guard size > condenseThreshold else { return transcript }
+
+        log.info("Transcript is \(size) chars (>\(self.condenseThreshold)) — condensing")
+        let chunks = TranscriptChunker.chunk(transcript)
+        var synopses: [String] = []
+        synopses.reserveCapacity(chunks.count)
+
+        for (i, chunk) in chunks.enumerated() {
+            let synopsis = try await chatCompletion(
+                messages: [
+                    .system("Ты ассистент рекрутера. Перескажи фрагмент интервью, сохранив ВСЕ ключевые факты, цифры, имена, технологии, решения и оценки. Не теряй детали. 300-500 слов."),
+                    .user("Фрагмент \(i+1)/\(chunks.count):\n\n\(AnalysisPrompts.formatTranscript(chunk))"),
+                ],
+                jsonMode:    false,
+                temperature: 0.2
+            )
+            synopses.append(synopsis)
+        }
+
+        let combined = synopses.enumerated()
+            .map { "## Фрагмент \($0.offset + 1)/\(synopses.count)\n\($0.element)" }
+            .joined(separator: "\n\n")
+
+        let condensed = TranscriptSegment(
+            speaker:   .candidate,
+            startTime: 0,
+            endTime:   transcript.durationSeconds,
+            text:      "[Краткое содержание длинного интервью — оригинал был \(size / 1000)к символов]\n\n\(combined)"
+        )
+
+        return Transcript(
+            segments:        [condensed],
+            language:        transcript.language,
+            durationSeconds: transcript.durationSeconds,
+            modelInfo:       transcript.modelInfo,
+            createdAt:       transcript.createdAt
+        )
+    }
+
     // MARK: - Structured outputs
 
     func generateSummary(
         transcript: Transcript,
         metadata: InterviewMetadata
     ) async throws -> Summary {
+
+        let transcript = try await ensureFits(transcript)
 
         struct DTO: Decodable {
             let overallImpression: String
@@ -102,6 +155,8 @@ final class OpenAICompatibleProvider: AnalysisProvider, @unchecked Sendable {
         metadata: InterviewMetadata
     ) async throws -> Recommendation {
 
+        let transcript = try await ensureFits(transcript)
+
         struct DTO: Decodable {
             let decision:   String
             let rationale:  String
@@ -132,6 +187,8 @@ final class OpenAICompatibleProvider: AnalysisProvider, @unchecked Sendable {
         metadata: InterviewMetadata
     ) async throws -> [FollowUpQuestion] {
 
+        let transcript = try await ensureFits(transcript)
+
         struct DTO: Decodable {
             let questions: [Q]
             struct Q: Decodable {
@@ -159,6 +216,8 @@ final class OpenAICompatibleProvider: AnalysisProvider, @unchecked Sendable {
         transcript: Transcript,
         metadata: InterviewMetadata
     ) async throws -> SWOTAnalysis {
+
+        let transcript = try await ensureFits(transcript)
 
         struct DTO: Decodable {
             let strengths:     [String]
@@ -236,6 +295,8 @@ final class OpenAICompatibleProvider: AnalysisProvider, @unchecked Sendable {
     // MARK: - HTTP helpers
 
     /// Single, non-streaming chat completion. Returns the assistant text.
+    /// Retries up to 3 times on transient network errors with exponential
+    /// backoff (1s, 2s, 4s).
     private func chatCompletion(
         messages: [Wire.Message],
         jsonMode: Bool = false,
@@ -243,29 +304,68 @@ final class OpenAICompatibleProvider: AnalysisProvider, @unchecked Sendable {
         maxTokens: Int? = nil
     ) async throws -> String {
 
-        var request = URLRequest(url: baseURL.appendingPathComponent("v1/chat/completions"))
-        request.httpMethod = "POST"
-        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
-        request.setValue("application/json",  forHTTPHeaderField: "Content-Type")
+        try await withRetry { [self] in
+            var request = URLRequest(url: baseURL.appendingPathComponent("v1/chat/completions"))
+            request.httpMethod = "POST"
+            request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+            request.setValue("application/json",  forHTTPHeaderField: "Content-Type")
 
-        let body = Wire.Request(
-            model:          model,
-            messages:       messages,
-            temperature:    temperature,
-            max_tokens:     maxTokens,
-            stream:         false,
-            response_format: jsonMode ? .init(type: "json_object") : nil
-        )
-        request.httpBody = try JSONEncoder().encode(body)
+            let body = Wire.Request(
+                model:          model,
+                messages:       messages,
+                temperature:    temperature,
+                max_tokens:     maxTokens,
+                stream:         false,
+                response_format: jsonMode ? .init(type: "json_object") : nil
+            )
+            request.httpBody = try JSONEncoder().encode(body)
 
-        let (data, response) = try await session.data(for: request)
-        try Self.validate(response: response, data: data)
+            let (data, response) = try await session.data(for: request)
+            try Self.validate(response: response, data: data)
 
-        let parsed = try JSONDecoder().decode(Wire.Response.self, from: data)
-        guard let content = parsed.choices.first?.message.content, !content.isEmpty else {
-            throw AnalysisError.empty
+            let parsed = try JSONDecoder().decode(Wire.Response.self, from: data)
+            guard let content = parsed.choices.first?.message.content, !content.isEmpty else {
+                throw AnalysisError.empty
+            }
+            return content
         }
-        return content
+    }
+
+    /// Run `op` with up to 3 attempts, retrying only on transient errors
+    /// (timeouts, dropped connections, 5xx). Auth and client errors fail
+    /// immediately because retrying would just waste time + tokens.
+    private func withRetry<T>(_ op: () async throws -> T) async throws -> T {
+        var lastError: Error?
+        for attempt in 0..<3 {
+            do {
+                return try await op()
+            } catch let e as AnalysisError {
+                if case .http(let status, _) = e, (500..<600).contains(status) {
+                    lastError = e
+                } else {
+                    throw e  // 4xx, parse, etc. — don't retry
+                }
+            } catch let e as URLError where isTransient(e) {
+                lastError = e
+            } catch {
+                throw error
+            }
+
+            let delay = UInt64(pow(2.0, Double(attempt))) * 1_000_000_000   // 1s, 2s, 4s
+            log.info("Retrying after \(delay / 1_000_000_000) s (attempt \(attempt + 1))")
+            try await Task.sleep(nanoseconds: delay)
+        }
+        throw lastError ?? AnalysisError.transport(URLError(.cannotConnectToHost))
+    }
+
+    private func isTransient(_ e: URLError) -> Bool {
+        switch e.code {
+        case .timedOut, .networkConnectionLost, .notConnectedToInternet,
+             .cannotConnectToHost, .dnsLookupFailed:
+            return true
+        default:
+            return false
+        }
     }
 
     /// Server-sent events streaming version. Yields text fragments.

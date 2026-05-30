@@ -28,13 +28,21 @@ enum AnalysisPrompts {
 
     /// Renders a transcript as `[Спикер] текст` lines with timestamps,
     /// suitable for inclusion in an LLM prompt.
+    /// For single-speaker transcripts (imported single-track recordings)
+    /// the speaker label is omitted — we don't actually know who said
+    /// what in that case.
     static func formatTranscript(_ transcript: Transcript) -> String {
-        transcript.segments
+        let showSpeaker = transcript.isMultiSpeaker
+        return transcript.segments
             .map { seg in
                 let mins = Int(seg.startTime) / 60
                 let secs = Int(seg.startTime) % 60
                 let ts   = String(format: "%02d:%02d", mins, secs)
-                return "[\(ts) \(seg.speaker.localizedName)] \(seg.text)"
+                if showSpeaker {
+                    return "[\(ts) \(seg.speaker.localizedName)] \(seg.text)"
+                } else {
+                    return "[\(ts)] \(seg.text)"
+                }
             }
             .joined(separator: "\n")
     }
@@ -204,6 +212,40 @@ enum AnalysisPrompts {
         """
     }
 
+    // MARK: - Notes template
+
+    /// Apply a user-defined "notes template" to a transcript. The model
+    /// uses the template as a style/structure example and produces notes
+    /// for the current interview in the same shape.
+    static func notesTemplateUserPrompt(
+        templateName: String,
+        templateContent: String,
+        transcript: Transcript,
+        metadata: InterviewMetadata
+    ) -> String {
+        """
+        \(candidateHeader(metadata))
+
+        У пользователя есть шаблон / пример заметок под названием «\(templateName)»:
+
+        --- ШАБЛОН ---
+        \(templateContent)
+        --- КОНЕЦ ШАБЛОНА ---
+
+        Твоя задача: сделать заметки по этому интервью в **той же структуре и \
+        стиле**, что и в шаблоне выше. Используй ту же иерархию заголовков, \
+        тот же тип списков, тот же уровень детализации.
+
+        Заполняй заметки информацией из транскрипта. Если каких-то разделов \
+        нет данных в транскрипте — пиши «нет данных» или пропускай, не выдумывай.
+
+        Ответ дай в markdown.
+
+        Транскрипт:
+        \(formatTranscript(transcript))
+        """
+    }
+
     // MARK: - Chat
 
     static func chatSystemPrompt(transcript: Transcript, metadata: InterviewMetadata) -> String {
@@ -223,6 +265,56 @@ enum AnalysisPrompts {
 }
 
 // MARK: - JSON extraction helper
+
+// MARK: - Transcript chunking for long interviews
+
+enum TranscriptChunker {
+
+    /// Rough character budget per chunk (~6000 chars ≈ 1500 tokens of Russian
+    /// transcript text — leaves room for system prompt + instructions + output).
+    static let charsPerChunk = 6000
+
+    /// Returns a list of timestamp-ordered transcript slices, each within
+    /// the character budget. Splits on segment boundaries only.
+    static func chunk(_ transcript: Transcript, maxChars: Int = charsPerChunk) -> [Transcript] {
+        guard !transcript.segments.isEmpty else { return [transcript] }
+
+        var chunks: [Transcript] = []
+        var current: [TranscriptSegment] = []
+        var currentChars = 0
+
+        for seg in transcript.segments {
+            let segLen = seg.text.count + 32  // overhead for "[mm:ss Спикер] "
+            if !current.isEmpty && currentChars + segLen > maxChars {
+                chunks.append(Self.make(transcript, segments: current))
+                current = []
+                currentChars = 0
+            }
+            current.append(seg)
+            currentChars += segLen
+        }
+        if !current.isEmpty {
+            chunks.append(Self.make(transcript, segments: current))
+        }
+        return chunks
+    }
+
+    private static func make(_ original: Transcript, segments: [TranscriptSegment]) -> Transcript {
+        Transcript(
+            segments:        segments,
+            language:        original.language,
+            durationSeconds: original.durationSeconds,
+            modelInfo:       original.modelInfo,
+            createdAt:       original.createdAt
+        )
+    }
+
+    /// Total character count of a transcript as it would be formatted for
+    /// the LLM. Cheap proxy for token count.
+    static func estimatedChars(_ transcript: Transcript) -> Int {
+        AnalysisPrompts.formatTranscript(transcript).count
+    }
+}
 
 enum JSONExtractor {
     /// LLMs occasionally wrap JSON in ```json fences or sprinkle prose

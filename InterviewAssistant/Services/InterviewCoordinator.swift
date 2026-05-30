@@ -17,6 +17,7 @@ import Foundation
 import OSLog
 import Combine
 import AVFoundation
+import AppKit
 
 @MainActor
 final class InterviewCoordinator: ObservableObject {
@@ -45,11 +46,62 @@ final class InterviewCoordinator: ObservableObject {
     /// All sessions persisted on disk, newest first. Refreshed on demand.
     @Published private(set) var allSessions: [Session] = []
 
+    /// ID of the session whose transcription is running RIGHT NOW.
+    /// `nil` when nothing is transcribing. There can only be one active
+    /// transcription at a time (WhisperKit is single-tenant); everything
+    /// else queues in `pendingTranscriptions`.
+    @Published private(set) var transcribingSessionID: UUID?
+
+    /// IDs of sessions waiting in the background transcription queue.
+    @Published private(set) var queuedTranscriptionIDs: [UUID] = []
+
     /// Fraction of the current transcription job done (0…1) or nil.
     @Published private(set) var transcriptionFraction: Double?
 
     /// Latest text snippet from Whisper — proves the pipeline is alive.
     @Published private(set) var transcriptionPreview: String = ""
+
+    /// Mirror of `TranscriptionService.state`, so the UI can show
+    /// "Loading model…" vs "Transcribing…" separately.
+    @Published private(set) var transcriptionServiceState: TranscriptionService.State = .idle
+
+    /// Seconds since the model started loading (only meaningful while
+    /// `transcriptionServiceState == .loadingModel`).
+    @Published private(set) var modelLoadingSeconds: Int = 0
+    private var modelLoadingTimer: Timer?
+    private var modelLoadingStartedAt: Date?
+
+    // ── Streaming chat / custom analysis ──────────────────────────────────
+
+    /// Conversation with the model about the currently loaded interview.
+    /// Reset whenever `currentSession` changes.
+    @Published var chatHistory: [ChatMessage] = []
+
+    /// Live text being streamed back from the model for chat. Empty when
+    /// idle.
+    @Published private(set) var streamingChatReply: String = ""
+
+    /// Live text being streamed for a custom analysis.
+    @Published private(set) var streamingCustomReply: String = ""
+
+    /// Title of the in-flight custom analysis (used for the saved artefact).
+    @Published private(set) var streamingCustomTitle: String = ""
+
+    /// Whether *some* streaming operation is in flight — disables the
+    /// "Send" / "Run" buttons in UI.
+    @Published private(set) var isStreaming: Bool = false
+
+    private var streamingTask: Task<Void, Never>?
+
+    /// Internal queue of background transcription jobs.
+    private struct PendingTranscription {
+        let sessionID:      UUID
+        let interviewerURL: URL
+        let candidateURL:   URL
+        let duration:       TimeInterval
+        let singleTrack:    Bool      // true for imported files
+    }
+    private var pendingTranscriptions: [PendingTranscription] = []
 
     // MARK: - Dependencies
 
@@ -93,6 +145,23 @@ final class InterviewCoordinator: ObservableObject {
             .receive(on: DispatchQueue.main)
             .assign(to: \.transcriptionPreview, on: self)
             .store(in: &cancellables)
+        transcription.$state
+            .receive(on: DispatchQueue.main)
+            .assign(to: \.transcriptionServiceState, on: self)
+            .store(in: &cancellables)
+
+        transcription.$state
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] state in
+                self?.handleTranscriptionState(state)
+            }
+            .store(in: &cancellables)
+
+        // Quietly start loading the Whisper model in the background so the
+        // first real recording doesn't wait for it.
+        Task { [weak self] in
+            try? await self?.transcription.prewarm()
+        }
     }
 
     // MARK: - Public API
@@ -131,8 +200,10 @@ final class InterviewCoordinator: ObservableObject {
         }
     }
 
-    /// Stop recording and automatically run the full transcribe + merge +
-    /// save pipeline. The UI doesn't have to chain anything itself.
+    /// Stop recording and queue transcription for background processing.
+    /// The user is freed up to start a new recording immediately — the
+    /// transcription continues silently and the sidebar shows a spinner
+    /// on the still-processing session.
     func stopAndProcess() async {
         guard state == .recording else { return }
         state = .stopping
@@ -144,7 +215,7 @@ final class InterviewCoordinator: ObservableObject {
             return
         }
 
-        // Update duration on the session and persist.
+        // Save metadata immediately so the sidebar row is "real".
         session.metadata = InterviewMetadata(
             candidateName: session.metadata.candidateName,
             position:      session.metadata.position,
@@ -153,25 +224,39 @@ final class InterviewCoordinator: ObservableObject {
         )
         currentSession = session
         try? store.save(session)
+        refreshSessions()
 
-        await runTranscription(for: session, recording: recording)
+        // The recording flow is done — let the user start another interview.
+        state = .ready
+
+        // Spin off the slow part in the background.
+        enqueueBackgroundTranscription(
+            sessionID:      session.id,
+            interviewerURL: recording.interviewerURL,
+            candidateURL:   recording.candidateURL,
+            duration:       recording.duration,
+            singleTrack:    false
+        )
     }
 
     /// Re-run transcription on an already recorded session (e.g. after
     /// changing the Whisper model or fixing audio). Useful for the
-    /// "Перетранскрибировать" button.
-    func retranscribe() async {
+    /// "Перетранскрибировать" button. Runs in background like a fresh
+    /// recording would.
+    func retranscribe() {
         guard let session = currentSession else { return }
+        let fm = FileManager.default
         let interviewerURL = store.interviewerAudioURL(for: session.id)
         let candidateURL   = store.candidateAudioURL(for: session.id)
+        let singleTrack    = !fm.fileExists(atPath: interviewerURL.path)
 
-        let recording = AudioCaptureService.Recording(
+        enqueueBackgroundTranscription(
+            sessionID:      session.id,
             interviewerURL: interviewerURL,
             candidateURL:   candidateURL,
-            startedAt:      session.metadata.recordedAt,
-            duration:       session.metadata.duration
+            duration:       session.metadata.duration,
+            singleTrack:    singleTrack
         )
-        await runTranscription(for: session, recording: recording)
     }
 
     /// Reset to a clean state, forgetting the current session reference.
@@ -182,7 +267,116 @@ final class InterviewCoordinator: ObservableObject {
         elapsedSeconds = 0
     }
 
+    /// Update metadata fields on the current session and persist.
+    func updateCurrentMetadata(candidateName: String?, position: String?) {
+        guard var session = currentSession else { return }
+        session.metadata.candidateName = candidateName?.isEmpty == true ? nil : candidateName
+        session.metadata.position      = position?.isEmpty      == true ? nil : position
+        try? store.save(session)
+        currentSession = session
+        refreshSessions()
+    }
+
     // MARK: - Internal
+
+    // MARK: - Background transcription queue
+
+    /// Add a transcription to the queue. If nothing is running, kick off
+    /// the worker; otherwise the job will be picked up automatically when
+    /// the current one finishes.
+    private func enqueueBackgroundTranscription(
+        sessionID: UUID,
+        interviewerURL: URL,
+        candidateURL: URL,
+        duration: TimeInterval,
+        singleTrack: Bool
+    ) {
+        let job = PendingTranscription(
+            sessionID:      sessionID,
+            interviewerURL: interviewerURL,
+            candidateURL:   candidateURL,
+            duration:       duration,
+            singleTrack:    singleTrack
+        )
+        pendingTranscriptions.append(job)
+        queuedTranscriptionIDs.append(sessionID)
+        log.info("Queued transcription for \(sessionID.uuidString); queue depth \(self.pendingTranscriptions.count)")
+
+        if transcribingSessionID == nil {
+            Task { @MainActor [weak self] in
+                await self?.drainTranscriptionQueue()
+            }
+        }
+    }
+
+    /// Pull jobs off the queue one at a time and process them. WhisperKit
+    /// is single-tenant, so we never want two of these running in parallel.
+    private func drainTranscriptionQueue() async {
+        while !pendingTranscriptions.isEmpty {
+            let job = pendingTranscriptions.removeFirst()
+            queuedTranscriptionIDs.removeAll { $0 == job.sessionID }
+            transcribingSessionID = job.sessionID
+            await runBackgroundJob(job)
+            transcribingSessionID = nil
+        }
+    }
+
+    /// Run a single job and persist the result. If the user is currently
+    /// viewing this session, update the on-screen copy too.
+    private func runBackgroundJob(_ job: PendingTranscription) async {
+        log.info("Background transcription started: \(job.sessionID.uuidString)")
+        let fm = FileManager.default
+
+        do {
+            // Imported single-track sessions only have the candidate file.
+            var interviewerSegments: [TranscriptSegment] = []
+            if !job.singleTrack && fm.fileExists(atPath: job.interviewerURL.path) {
+                interviewerSegments = try await transcription.transcribe(
+                    audioURL: job.interviewerURL, as: .interviewer
+                )
+            }
+            let candidateSegments = try await transcription.transcribe(
+                audioURL: job.candidateURL, as: .candidate
+            )
+            let merged = merger.merge(
+                interviewer: interviewerSegments,
+                candidate:   candidateSegments
+            )
+
+            let modelInfo = transcription.modelInfo
+                ?? TranscriptionModelInfo(
+                    provider: "whisperkit",
+                    model:    "unknown",
+                    version:  "unknown"
+                )
+            let transcript = Transcript(
+                segments:        merged,
+                language:        "ru",
+                durationSeconds: job.duration,
+                modelInfo:       modelInfo
+            )
+
+            // Re-load the session in case other state has changed.
+            var updated = (try? store.load(id: job.sessionID))
+                ?? Session(id: job.sessionID, metadata: InterviewMetadata(duration: job.duration))
+            updated.transcript = transcript
+            try store.save(updated)
+
+            // If the user is currently viewing this session, refresh the
+            // detail view too.
+            if currentSession?.id == updated.id {
+                currentSession = updated
+                state = .ready
+            }
+            refreshSessions()
+            log.info("Background transcription done: \(merged.count) segments")
+        } catch {
+            log.error("Background transcription failed: \(error.localizedDescription)")
+            if currentSession?.id == job.sessionID {
+                lastAnalysisError = "Транскрипция: \(error.localizedDescription)"
+            }
+        }
+    }
 
     private func runTranscription(
         for session: Session,
@@ -324,8 +518,42 @@ final class InterviewCoordinator: ObservableObject {
         }
     }
 
+    /// Look for sessions that have audio on disk but no transcript yet
+    /// (typically because the previous run of the app was killed mid-job)
+    /// and queue them for background transcription.
+    ///
+    /// Safe to call multiple times — a session that's already being
+    /// transcribed or queued won't be enqueued again.
+    func resumeIncompleteTranscriptions() {
+        refreshSessions()
+        let fm = FileManager.default
+
+        for session in allSessions where session.transcript == nil {
+            // Skip if already in flight or queued
+            if transcribingSessionID == session.id { continue }
+            if queuedTranscriptionIDs.contains(session.id) { continue }
+
+            let candidateURL = store.candidateAudioURL(for: session.id)
+            guard fm.fileExists(atPath: candidateURL.path) else { continue }
+
+            let interviewerURL = store.interviewerAudioURL(for: session.id)
+            let singleTrack    = !fm.fileExists(atPath: interviewerURL.path)
+
+            log.info("Resuming interrupted transcription for \(session.id.uuidString)")
+            enqueueBackgroundTranscription(
+                sessionID:      session.id,
+                interviewerURL: interviewerURL,
+                candidateURL:   candidateURL,
+                duration:       session.metadata.duration,
+                singleTrack:    singleTrack
+            )
+        }
+    }
+
     /// Switch the UI to viewing a previously recorded session.
     func loadSession(_ id: UUID) {
+        cancelStreaming()
+        chatHistory = []
         do {
             let session = try store.load(id: id)
             currentSession = session
@@ -336,6 +564,33 @@ final class InterviewCoordinator: ObservableObject {
             log.error("Could not load session \(id.uuidString): \(error.localizedDescription)")
             state = .failed(error.localizedDescription)
         }
+    }
+
+    /// Drive the model-loading timer based on TranscriptionService state.
+    private func handleTranscriptionState(_ state: TranscriptionService.State) {
+        if case .loadingModel = state {
+            if modelLoadingStartedAt == nil {
+                modelLoadingStartedAt = Date()
+                modelLoadingSeconds = 0
+                modelLoadingTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+                    Task { @MainActor in
+                        guard let self, let started = self.modelLoadingStartedAt else { return }
+                        self.modelLoadingSeconds = Int(Date().timeIntervalSince(started))
+                    }
+                }
+            }
+        } else {
+            modelLoadingTimer?.invalidate()
+            modelLoadingTimer = nil
+            modelLoadingStartedAt = nil
+            modelLoadingSeconds = 0
+        }
+    }
+
+    /// Open the session's folder in Finder.
+    func revealInFinder(_ id: UUID) {
+        let dir = store.sessionDirectory(for: id)
+        NSWorkspace.shared.activateFileViewerSelecting([dir])
     }
 
     /// Permanently delete a session and its files.
@@ -379,7 +634,7 @@ final class InterviewCoordinator: ObservableObject {
                 recordedAt:    Date(),
                 duration:      duration
             )
-            var session = try store.create(metadata: metadata)
+            let session = try store.create(metadata: metadata)
             currentSession = session
 
             // Make sure the audio dir exists (SessionStore.create already
@@ -395,35 +650,237 @@ final class InterviewCoordinator: ObservableObject {
                 .appendingPathComponent("candidate.m4a")
             try await extractAudio(from: sourceURL, to: candidateURL)
 
-            state = .transcribing
-
-            let candidateSegments = try await transcription.transcribe(
-                audioURL: candidateURL,
-                as: .candidate
-            )
-
-            let modelInfo = transcription.modelInfo
-                ?? TranscriptionModelInfo(
-                    provider: "whisperkit",
-                    model:    "unknown",
-                    version:  "unknown"
-                )
-
-            session.transcript = Transcript(
-                segments:         candidateSegments,
-                language:         "ru",
-                durationSeconds:  duration,
-                modelInfo:        modelInfo
-            )
-            try store.save(session)
-            currentSession = session
+            // Audio is in place — release the UI and let transcription
+            // run in the background, same as a recorded session.
             state = .ready
             refreshSessions()
-            log.info("Import complete: \(candidateSegments.count) segments")
+
+            enqueueBackgroundTranscription(
+                sessionID:      session.id,
+                interviewerURL: store.interviewerAudioURL(for: session.id), // won't exist
+                candidateURL:   candidateURL,
+                duration:       duration,
+                singleTrack:    true
+            )
+            log.info("Imported \(sourceURL.lastPathComponent); transcription queued")
         } catch {
             log.error("Import failed: \(error.localizedDescription)")
             state = .failed(error.localizedDescription)
         }
+    }
+
+    // MARK: - Streaming: chat with the model
+
+    /// Send the user's message to the model and stream the reply token by
+    /// token into `streamingChatReply`. When the stream finishes, the full
+    /// exchange is committed to `chatHistory`.
+    func sendChatMessage(_ text: String) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              let session = currentSession,
+              let transcript = session.transcript,
+              let provider = providerSettings.currentProvider()
+        else {
+            lastAnalysisError = "Сначала запиши и расшифруй интервью + настрой LLM-провайдера"
+            return
+        }
+
+        let userMessage = ChatMessage(role: .user, content: trimmed)
+        chatHistory.append(userMessage)
+        streamingChatReply = ""
+        isStreaming = true
+
+        // Keep only the last few turns to avoid blowing past the model's
+        // context window — system prompt + transcript already eat a lot.
+        let trimmedHistory = Self.trimChatHistory(chatHistory)
+
+        streamingTask = Task { [history = trimmedHistory, weak self] in
+            guard let self else { return }
+            var accumulated = ""
+            do {
+                let stream = provider.streamChat(
+                    messages:   history,
+                    transcript: transcript,
+                    metadata:   session.metadata
+                )
+                for try await chunk in stream {
+                    accumulated += chunk
+                    self.streamingChatReply = accumulated
+                }
+                if !accumulated.isEmpty {
+                    self.chatHistory.append(ChatMessage(role: .assistant, content: accumulated))
+                }
+            } catch is CancellationError {
+                // Quietly drop
+            } catch {
+                self.lastAnalysisError = "Чат: \(error.localizedDescription)"
+            }
+            self.streamingChatReply = ""
+            self.isStreaming = false
+            self.streamingTask = nil
+        }
+    }
+
+    /// Drop the running chat or custom-analysis stream.
+    func cancelStreaming() {
+        streamingTask?.cancel()
+        streamingTask = nil
+        isStreaming = false
+        streamingChatReply = ""
+        streamingCustomReply = ""
+    }
+
+    /// Reset the chat panel (forget all prior messages).
+    func resetChat() {
+        cancelStreaming()
+        chatHistory = []
+    }
+
+    /// Drop oldest chat turns until the remaining text fits a soft budget.
+    /// Rough heuristic: 4 chars ≈ 1 token, target ≤ 4000 tokens of chat
+    /// history (leaves headroom for system prompt + transcript + reply).
+    private static func trimChatHistory(_ history: [ChatMessage]) -> [ChatMessage] {
+        let budgetChars = 16_000
+        var total = 0
+        var kept: [ChatMessage] = []
+        for msg in history.reversed() {
+            total += msg.content.count
+            if total > budgetChars && !kept.isEmpty { break }
+            kept.append(msg)
+        }
+        return kept.reversed()
+    }
+
+    // MARK: - Streaming: custom analysis (free-form prompt)
+
+    /// Run an arbitrary prompt against the transcript and stream the
+    /// markdown answer into `streamingCustomReply`. When complete, the
+    /// answer is persisted as a `CustomAnalysis` on the session.
+    func runCustomAnalysis(title: String, prompt: String) {
+        let promptT = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        let titleT  = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !promptT.isEmpty,
+              var session = currentSession,
+              let transcript = session.transcript,
+              let provider = providerSettings.currentProvider()
+        else {
+            lastAnalysisError = "Введи промпт и убедись, что интервью расшифровано и LLM-провайдер настроен"
+            return
+        }
+
+        let resolvedTitle = titleT.isEmpty ? "Свой анализ" : titleT
+
+        streamingCustomTitle = resolvedTitle
+        streamingCustomReply = ""
+        isStreaming = true
+
+        streamingTask = Task { [weak self] in
+            guard let self else { return }
+            var accumulated = ""
+            do {
+                let stream = provider.streamCustomAnalysis(
+                    title:      resolvedTitle,
+                    prompt:     promptT,
+                    transcript: transcript,
+                    metadata:   session.metadata
+                )
+                for try await chunk in stream {
+                    accumulated += chunk
+                    self.streamingCustomReply = accumulated
+                }
+                if !accumulated.isEmpty {
+                    let analysis = CustomAnalysis(
+                        title:    resolvedTitle,
+                        prompt:   promptT,
+                        result:   accumulated,
+                        provider: provider.providerInfo
+                    )
+                    session.customAnalyses.append(analysis)
+                    try? self.store.save(session)
+                    self.currentSession = session
+                    self.refreshSessions()
+                }
+            } catch is CancellationError {
+                // Quietly drop
+            } catch {
+                self.lastAnalysisError = "Свой анализ: \(error.localizedDescription)"
+            }
+            self.streamingCustomReply = ""
+            self.streamingCustomTitle = ""
+            self.isStreaming = false
+            self.streamingTask = nil
+        }
+    }
+
+    /// Apply a user-defined notes template to the current session. The
+    /// underlying mechanism is the same streaming custom-analysis flow —
+    /// we just use a different prompt and the template's name as title.
+    func applyNotesTemplate(_ template: NotesTemplate) {
+        guard var session = currentSession,
+              let transcript = session.transcript,
+              let provider = providerSettings.currentProvider()
+        else {
+            lastAnalysisError = "Сначала запиши и расшифруй интервью + настрой LLM-провайдера"
+            return
+        }
+
+        streamingCustomTitle = template.name
+        streamingCustomReply = ""
+        isStreaming = true
+
+        let prompt = AnalysisPrompts.notesTemplateUserPrompt(
+            templateName:    template.name,
+            templateContent: template.promptTemplate,
+            transcript:      transcript,
+            metadata:        session.metadata
+        )
+
+        streamingTask = Task { [weak self] in
+            guard let self else { return }
+            var accumulated = ""
+            do {
+                let stream = provider.streamChat(
+                    messages: [
+                        ChatMessage(role: .system, content: AnalysisPrompts.systemRecruiterBase),
+                        ChatMessage(role: .user,   content: prompt),
+                    ],
+                    transcript: transcript,
+                    metadata:   session.metadata
+                )
+                for try await chunk in stream {
+                    accumulated += chunk
+                    self.streamingCustomReply = accumulated
+                }
+                if !accumulated.isEmpty {
+                    let analysis = CustomAnalysis(
+                        title:    template.name,
+                        prompt:   "Шаблон: \(template.name)",
+                        result:   accumulated,
+                        provider: provider.providerInfo
+                    )
+                    session.customAnalyses.append(analysis)
+                    try? self.store.save(session)
+                    self.currentSession = session
+                    self.refreshSessions()
+                }
+            } catch is CancellationError {
+                // Quietly drop
+            } catch {
+                self.lastAnalysisError = "Шаблон «\(template.name)»: \(error.localizedDescription)"
+            }
+            self.streamingCustomReply = ""
+            self.streamingCustomTitle = ""
+            self.isStreaming = false
+            self.streamingTask = nil
+        }
+    }
+
+    /// Delete a previously saved custom analysis.
+    func deleteCustomAnalysis(_ id: UUID) {
+        guard var session = currentSession else { return }
+        session.customAnalyses.removeAll { $0.id == id }
+        try? store.save(session)
+        currentSession = session
     }
 
     /// Extract the audio track of any media file (audio or video) into an
@@ -441,22 +898,10 @@ final class InterviewCoordinator: ObservableObject {
                 userInfo: [NSLocalizedDescriptionKey: "Не удалось создать экспортёр для этого формата"]
             )
         }
-        export.outputURL = target
-        export.outputFileType = .m4a
         export.audioTimePitchAlgorithm = .spectral
 
-        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-            export.exportAsynchronously {
-                switch export.status {
-                case .completed:
-                    cont.resume()
-                default:
-                    let err = export.error
-                        ?? NSError(domain: "Import", code: 2,
-                                   userInfo: [NSLocalizedDescriptionKey: "Экспорт аудио прерван"])
-                    cont.resume(throwing: err)
-                }
-            }
-        }
+        // macOS 15+ async API — avoids bridging the legacy callback API
+        // (which Swift 6 won't let us capture in a Sendable closure).
+        try await export.export(to: target, as: .m4a)
     }
 }

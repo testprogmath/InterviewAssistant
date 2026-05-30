@@ -63,6 +63,14 @@ struct Transcript: Codable, Hashable, Sendable {
             .map { "[\($0.speaker.localizedName)] \($0.text)" }
             .joined(separator: "\n")
     }
+
+    /// True if the transcript contains more than one distinct speaker.
+    /// Single-track imports yield one speaker for every segment, in
+    /// which case the speaker column is just noise — UI hides it and
+    /// prompts omit it.
+    var isMultiSpeaker: Bool {
+        Set(segments.map(\.speaker)).count > 1
+    }
 }
 
 struct TranscriptionModelInfo: Codable, Hashable, Sendable {

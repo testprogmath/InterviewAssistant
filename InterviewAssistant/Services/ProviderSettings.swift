@@ -110,9 +110,7 @@ final class ProviderSettings: ObservableObject {
             return OpenAICompatibleProvider.openAI(apiKey: apiKey, model: model)
 
         case .ollama:
-            // Implemented in a follow-up file; nil for now so the UI can
-            // still build.
-            return nil
+            return OllamaProvider(model: model)
         }
     }
 }

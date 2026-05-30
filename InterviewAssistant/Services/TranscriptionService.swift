@@ -63,8 +63,10 @@ final class TranscriptionService: ObservableObject {
 
     // MARK: - Init
 
-    init(modelName: String = "openai_whisper-large-v3-v20240930_turbo_632MB") {
-        self.modelName = modelName
+    /// If `modelName` is nil, the user's current selection (`WhisperSettings`)
+    /// is read from UserDefaults. Pass an explicit name in tests.
+    init(modelName: String? = nil) {
+        self.modelName = modelName ?? WhisperSettings.currentModelID()
     }
 
     // MARK: - Public API
