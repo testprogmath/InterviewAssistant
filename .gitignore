@@ -1,0 +1,39 @@
+# ── Xcode ──────────────────────────────────────────────────────────────────
+build/
+DerivedData/
+*.xcuserstate
+*.xcuserdata
+xcuserdata/
+**/xcuserdata/
+*.xcscmblueprint
+*.xccheckout
+*.hmap
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+# ── Swift Package Manager ──────────────────────────────────────────────────
+.swiftpm/
+.build/
+Packages/
+Package.pins
+Package.resolved
+
+# ── macOS ──────────────────────────────────────────────────────────────────
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+
+# ── Secrets ────────────────────────────────────────────────────────────────
+.env
+.env.*
+*.pem
+*.key
+secrets/
+
+# ── Editor leftovers ───────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*~
