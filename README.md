@@ -147,8 +147,8 @@ WhisperKit на Apple Neural Engine, и отдаёт результат LLM-пр
 
 ## Требования
 
-- **macOS 14 Sonoma** или новее (используем `AVAudioVoiceProcessingOtherAudioDuckingConfiguration`
-  для AEC без приглушения системного звука)
+- **macOS 15 Sequoia** или новее (нужен для `AVAssetExportSession.export(to:as:)`,
+  `AVAudioVoiceProcessingOtherAudioDuckingConfiguration` и `SettingsLink`)
 - **Apple Silicon** (M1/M2/M3) для ANE-ускорения WhisperKit
 - **~2 ГБ свободного места** для модели Whisper + кеша Core ML
 
